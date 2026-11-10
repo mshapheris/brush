@@ -34,11 +34,16 @@ obj.license = "MIT - https://opensource.org/licenses/MIT"
 --- Colour of the dimming layer in spotlight mode. The alpha is how dark it gets.
 obj.dimColor = { red = 0, green = 0, blue = 0, alpha = 0.65 }
 
---- Brush.drawDimAlpha
+--- Brush.sweepDuration
 --- Variable
---- Alpha of the dimming layer while in draw mode. 0 means the screen is not
---- dimmed while drawing.
-obj.drawDimAlpha = 0
+--- Seconds the dim takes to sweep in from the screen edges to the spotlight
+--- (and back out) when the layer is toggled or the mode changes.
+obj.sweepDuration = 0.22
+
+--- Brush.sweepFps
+--- Variable
+--- Frame rate of the sweep animation.
+obj.sweepFps = 60
 
 --- Brush.spotlightRadius
 --- Variable
@@ -89,11 +94,6 @@ obj.fadeDuration = 1.0
 --- Frames per second for the fade animation.
 obj.fps = 30
 
---- Brush.layerFadeTime
---- Variable
---- Seconds for the layer to fade in and out when toggled.
-obj.layerFadeTime = 0.15
-
 --- Brush.showHint
 --- Variable
 --- Show a small mode/keys hint at the top of each screen while the layer is on.
@@ -127,6 +127,9 @@ obj._width = nil
 obj._modal = nil
 obj._tap = nil
 obj._fadeTimer = nil
+obj._sweep = nil -- { from, to, startedAt, duration, onDone }
+obj._sweepTimer = nil
+obj._holeRadius = nil -- radius currently drawn (differs from _radius mid-sweep)
 obj._layers = {} -- list of { canvas, frame, strokes = {...}, base = n }
 obj._current = nil -- stroke currently being drawn
 
@@ -169,11 +172,11 @@ function obj:_buildLayers()
       frame = { x = 0, y = 0, w = f.w, h = f.h },
     }
     c[2] = {
-      id = "hole", type = "circle", action = "skip",
+      id = "hole", type = "circle", action = "fill",
       fillColor = { red = 0, green = 0, blue = 0, alpha = 1 },
       compositeRule = "destinationOut",
       center = { x = f.w / 2, y = f.h / 2 },
-      radius = self._radius,
+      radius = self._holeRadius,
     }
     c[3] = {
       id = "hint", type = "text", action = self.showHint and "fill" or "skip",
@@ -184,17 +187,19 @@ function obj:_buildLayers()
     }
 
     table.insert(self._layers, { canvas = c, frame = f, strokes = {} })
-    c:show(self.layerFadeTime)
+    c:show()
   end
   self:_applyMode()
 end
 
 function obj:_destroyLayers()
   for _, layer in ipairs(self._layers) do
-    layer.canvas:delete(self.layerFadeTime)
+    layer.canvas:delete()
   end
   self._layers = {}
   self._current = nil
+  self._sweep = nil
+  if self._sweepTimer then self._sweepTimer:stop(); self._sweepTimer = nil end
 end
 
 function obj:_layerAt(point)
@@ -208,29 +213,118 @@ function obj:_layerAt(point)
 end
 
 function obj:_applyMode()
-  local draw = self._mode == "draw"
-  local dimAlpha = draw and self.drawDimAlpha or self.dimColor.alpha
   local hint = self:_hintText()
   for _, layer in ipairs(self._layers) do
-    local c = layer.canvas
-    c:elementAttribute(1, "fillColor", withAlpha(self.dimColor, dimAlpha))
-    c:elementAttribute(3, "text", hint)
+    layer.canvas:elementAttribute(3, "text", hint)
   end
   self:_updateSpotlight(hs.mouse.absolutePosition())
 end
 
+-- Show or hide the dim rectangle and hole on every layer. While the dim is
+-- hidden (draw mode, after the sweep has finished) nothing is redrawn on
+-- mouse moves.
+function obj:_setDimVisible(visible)
+  local action = visible and "fill" or "skip"
+  for _, layer in ipairs(self._layers) do
+    layer.canvas:elementAttribute(1, "action", action)
+    layer.canvas:elementAttribute(2, "action", action)
+  end
+  self._dimVisible = visible
+end
+
+-- The hole is drawn on every layer, centred on the cursor's absolute position
+-- (which may be off that layer's canvas). That way the spotlight can cross a
+-- screen boundary, and the sweep animation is coherent across screens.
 function obj:_updateSpotlight(point)
-  local showHole = self._mode == "spotlight"
+  if not self._dimVisible then return end
+  local r = self._holeRadius or self._radius
   for _, layer in ipairs(self._layers) do
     local c = layer.canvas
-    if showHole and layer == self:_layerAt(point) then
-      c:elementAttribute(2, "center", { x = point.x - layer.frame.x, y = point.y - layer.frame.y })
-      c:elementAttribute(2, "radius", self._radius)
-      c:elementAttribute(2, "action", "fill")
-    else
-      c:elementAttribute(2, "action", "skip")
+    c:elementAttribute(2, "center", { x = point.x - layer.frame.x, y = point.y - layer.frame.y })
+    c:elementAttribute(2, "radius", r)
+  end
+end
+
+---------------------------------------------------------------------------
+-- Sweep animation (dim moves in from the edges to the spotlight, or back out)
+---------------------------------------------------------------------------
+
+-- Radius at which a hole centred on `point` clears every corner of every
+-- layer, so the dim is completely invisible.
+function obj:_coverRadius(point)
+  local frames = {}
+  for _, layer in ipairs(self._layers) do table.insert(frames, layer.frame) end
+  return self:_coverRadiusForFrames(point, frames)
+end
+
+function obj:_coverRadiusForScreens(point)
+  local frames = {}
+  for _, screen in ipairs(hs.screen.allScreens()) do table.insert(frames, screen:fullFrame()) end
+  return self:_coverRadiusForFrames(point, frames)
+end
+
+function obj:_coverRadiusForFrames(point, frames)
+  local r = 0
+  for _, f in ipairs(frames) do
+    for _, cx in ipairs({ f.x, f.x + f.w }) do
+      for _, cy in ipairs({ f.y, f.y + f.h }) do
+        local d = math.sqrt((cx - point.x) ^ 2 + (cy - point.y) ^ 2)
+        if d > r then r = d end
+      end
     end
   end
+  return r * 1.1 + (self._width or self.strokeWidth) -- margin for cursor movement
+end
+
+local function easeOutCubic(t)
+  local u = 1 - t
+  return 1 - u * u * u
+end
+
+function obj:_startSweep(from, to, onDone)
+  self._sweep = {
+    from = from, to = to, onDone = onDone,
+    startedAt = hs.timer.secondsSinceEpoch(),
+    duration = self.sweepDuration,
+  }
+  self:_setDimVisible(true)
+  self._holeRadius = from
+  self:_updateSpotlight(hs.mouse.absolutePosition())
+  if not self._sweepTimer then
+    self._sweepTimer = hs.timer.doEvery(1 / self.sweepFps, function() self:_sweepTick() end)
+  end
+end
+
+function obj:_sweepTick()
+  local sw = self._sweep
+  if not sw then
+    if self._sweepTimer then self._sweepTimer:stop(); self._sweepTimer = nil end
+    return
+  end
+  local t = (hs.timer.secondsSinceEpoch() - sw.startedAt) / sw.duration
+  if t >= 1 then
+    self._holeRadius = sw.to
+    self:_updateSpotlight(hs.mouse.absolutePosition())
+    self._sweep = nil
+    if self._sweepTimer then self._sweepTimer:stop(); self._sweepTimer = nil end
+    if sw.onDone then sw.onDone() end
+    return
+  end
+  self._holeRadius = sw.from + (sw.to - sw.from) * easeOutCubic(t)
+  self:_updateSpotlight(hs.mouse.absolutePosition())
+end
+
+-- Dim sweeps in from the screen edges to the spotlight.
+function obj:_sweepIn()
+  local cover = self:_coverRadius(hs.mouse.absolutePosition())
+  self:_startSweep(cover, self._radius, nil)
+end
+
+-- Dim sweeps out from the spotlight past the screen edges, then `onDone`.
+function obj:_sweepOut(onDone)
+  local cover = self:_coverRadius(hs.mouse.absolutePosition())
+  local from = self._sweep and self._holeRadius or self._radius
+  self:_startSweep(from, cover, onDone)
 end
 
 ---------------------------------------------------------------------------
@@ -393,6 +487,13 @@ end
 --- Set the spotlight radius in points. Clamped to minRadius..maxRadius.
 function obj:setRadius(radius)
   self._radius = clamp(radius, self.minRadius, self.maxRadius)
+  if self._sweep then
+    if self._sweep.from == self._sweep.to then return self end
+    -- A sweep that is heading for the spotlight should land on the new size.
+    if self._sweep.onDone == nil then self._sweep.to = self._radius end
+    return self
+  end
+  self._holeRadius = self._radius
   self:_updateSpotlight(hs.mouse.absolutePosition())
   return self
 end
@@ -424,11 +525,18 @@ function obj:setMode(mode)
   if mode ~= "draw" and mode ~= "spotlight" then
     error("Brush: mode must be 'draw' or 'spotlight'", 2)
   end
-  if self._mode == "draw" and mode ~= "draw" then
+  local was = self._mode
+  if was == "draw" and mode ~= "draw" then
     self:_endStroke()
   end
   self._mode = mode
-  if self._active then self:_applyMode() end
+  if not self._active then return self end
+  self:_applyMode()
+  if mode == "draw" and (was ~= "draw" or self._dimVisible) then
+    self:_sweepOut(function() self:_setDimVisible(false) end)
+  elseif mode == "spotlight" and (was ~= "spotlight" or not self._dimVisible) then
+    self:_sweepIn()
+  end
   return self
 end
 
@@ -452,7 +560,16 @@ function obj:enter(mode)
   self._width = self._width or self.strokeWidth
   self._mode = mode or self.startMode or self._mode
 
+  -- Layers come up with the hole covering everything, so the dim is invisible
+  -- until the sweep brings it in.
+  self._holeRadius = self:_coverRadiusForScreens(hs.mouse.absolutePosition())
+  self._dimVisible = true
   self:_buildLayers()
+  if self._mode == "draw" then
+    self:_setDimVisible(false)
+  else
+    self:_sweepIn()
+  end
 
   local t = hs.eventtap.event.types
   self._tap = hs.eventtap.new(
@@ -466,7 +583,8 @@ end
 
 --- Brush:exit()
 --- Method
---- Turn the layer off.
+--- Turn the layer off. The dim sweeps out past the screen edges first; strokes
+--- are removed straight away.
 function obj:exit()
   if not self._active then return self end
   self._active = false
@@ -475,11 +593,12 @@ function obj:exit()
     self._tap:stop()
     self._tap = nil
   end
-  if self._fadeTimer then
-    self._fadeTimer:stop()
-    self._fadeTimer = nil
+  self:clear()
+  if self._dimVisible then
+    self:_sweepOut(function() self:_destroyLayers() end)
+  else
+    self:_destroyLayers()
   end
-  self:_destroyLayers()
   return self
 end
 
